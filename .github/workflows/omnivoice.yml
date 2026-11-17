@@ -7,14 +7,14 @@ on:
         description: "Row number in PIPELINE_VIDEO_KARAOKE!TASKS (>= 2)"
         required: true
       pdf_link:
-        description: "PDF link from Column A (optional when stage=voiceover)"
+        description: "PDF link from Column A (optional when stage=voiceover/align)"
         required: false
         default: ""
       project_name:
         description: "Project folder name or Drive Folder URL (Column C)"
         required: true
       stage:
-        description: "voiceover (10 parallel shards + Job 11 merge) | merge | prepare | html | auto"
+        description: "voiceover (10 shards + #11 merge+align) | align (0-TTS word align) | merge | prepare | html | auto"
         required: false
         default: "voiceover"
       chunk_start:
@@ -42,6 +42,7 @@ concurrency:
 
 env:
   HF_HOME: ${{ github.workspace }}/.hf
+  TORCH_HOME: ${{ github.workspace }}/.torch
   HF_HUB_DISABLE_TELEMETRY: "1"
 
 jobs:
@@ -157,9 +158,9 @@ jobs:
             --ref-audio peter_ref.wav
 
   voiceover_merge:
-    name: "Process #11 — Merge All Chunks (0.5s Gap) & -14 LUFS"
+    name: "Process #11 — Merge (0.5s Gap, -14 LUFS) & MMS_FA Word Alignment"
     needs: [voiceover_shards]
-    if: always() && github.event_name == 'workflow_dispatch' && ((inputs.stage == 'voiceover' || inputs.stage == 'auto') || inputs.stage == 'merge') && (needs.voiceover_shards.result == 'success' || needs.voiceover_shards.result == 'failure' || needs.voiceover_shards.result == 'skipped')
+    if: always() && github.event_name == 'workflow_dispatch' && (inputs.stage == 'voiceover' || inputs.stage == 'merge' || inputs.stage == 'align' || inputs.stage == 'auto') && (needs.voiceover_shards.result == 'success' || needs.voiceover_shards.result == 'failure' || needs.voiceover_shards.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -176,22 +177,33 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
 
-      - name: Install lightweight audio merge dependencies
+      - name: Cache TorchAudio MMS_FA model weights
+        uses: actions/cache@v4
+        with:
+          path: .torch
+          key: pdfkara-mms-fa-torch-v1
+
+      - name: Install FFmpeg & TorchAudio Forced-Alignment CPU packages
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg >/dev/null
           python -m pip install -q --upgrade pip
+          pip install -q torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -q soundfile numpy google-api-python-client google-auth
 
-      - name: Merge all chunks with 0.5s spacing -> voiceover_final.wav + timings.json
+      - name: Merge chunks (0.5s gap) & compute 20ms per-word alignments -> timings.json
         env:
           IN_ROW: ${{ inputs.row }}
           IN_PROJ: ${{ inputs.project_name }}
           IN_GAP: ${{ inputs.gap_sec }}
           IN_STAGE: ${{ inputs.stage }}
         run: |
+          MODE_ARG="merge"
+          if [[ "${IN_STAGE}" == "align" ]]; then
+            MODE_ARG="align"
+          fi
           python -u scripts/voiceover.py \
-            --mode merge \
+            --mode "${MODE_ARG}" \
             --gap-sec "${IN_GAP:-0.5}" \
             --row "${IN_ROW}" \
             --project "${IN_PROJ}" \
@@ -202,7 +214,7 @@ jobs:
           fi
 
       - name: Self-dispatch continuation if any shard chunk remained unfinished
-        if: always()
+        if: always() && inputs.stage != 'align'
         env:
           IN_ROW: ${{ inputs.row }}
         run: python scripts/gcommon.py checkpoint-dispatch --row "${IN_ROW}" --state-file work/checkpoint_state.json
