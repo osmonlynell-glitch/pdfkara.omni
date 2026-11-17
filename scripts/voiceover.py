@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -146,15 +147,26 @@ def run_shard_synthesis(
         lang = c_item.get("lang") or detect_lang(text)
         t0 = time.monotonic()
 
-        audio = model.generate(
-            text=text,
-            language=lang,
-            voice_clone_prompt=voice_prompt,
-            speed=args.speed,
-            num_step=args.num_step,
-        )[0].astype(np.float32)
+        if not re.search(r"[A-Za-z0-9\u00C0-\u1EF9]", text):
+            audio = np.zeros(int(0.15 * SR), dtype=np.float32)
+        else:
+            try:
+                raw_gen = model.generate(
+                    text=text,
+                    language=lang,
+                    voice_clone_prompt=voice_prompt,
+                    speed=args.speed,
+                    num_step=args.num_step,
+                )
+                audio = raw_gen[0].astype(np.float32) if len(raw_gen) > 0 else np.zeros(0, dtype=np.float32)
+            except Exception as gen_err:
+                print(f"[Shard {args.shard_id}] Warn empty/failed synth on idx={idx} ({text!r}): {gen_err}", flush=True)
+                audio = np.zeros(int(0.15 * SR), dtype=np.float32)
 
-        peak = float(np.max(np.abs(audio))) or 1.0
+        if audio.size == 0:
+            audio = np.zeros(int(0.15 * SR), dtype=np.float32)
+
+        peak = float(np.max(np.abs(audio))) if audio.size > 0 else 1.0
         if peak > 0.96:
             audio = audio / peak * 0.96
 
