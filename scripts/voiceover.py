@@ -9,12 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-import torch
 
 from gcommon import (
     download_drive_file,
     ensure_folder,
-    extract_drive_id,
     file_view_url,
     folder_url,
     get_services,
@@ -28,9 +26,8 @@ from gcommon import (
 SR = 24000
 FPS = 30
 LEAD_IN_S = 0.30
-SAME_PAGE_PAUSE_S = 0.18
-PAGE_TURN_PAUSE_S = 0.42
-TAIL_S = 0.45
+CHUNK_GAP_S = 0.50  # Khoảng nghỉ chuẩn 0.5 giây giữa các chunks theo yêu cầu
+TAIL_S = 0.50
 
 
 def detect_lang(text: str) -> str:
@@ -76,145 +73,189 @@ def loudnorm_wav(in_wav: Path, out_wav: Path, target_lufs: float = -14.0):
     )
 
 
-def main():
-    t_job_start = time.monotonic()
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--row", type=int, required=True)
-    ap.add_argument("--project", default="")
-    ap.add_argument("--start", type=int, default=0)
-    ap.add_argument("--ref-audio", default="peter_ref.wav")
-    ap.add_argument("--num-step", type=int, default=32)
-    ap.add_argument("--speed", type=float, default=1.0)
-    ap.add_argument("--max-minutes", type=float, default=float(os.environ.get("OMNI_SOFT_LIMIT_MIN", "225")))
-    ap.add_argument("--checkpoint-state", default="work/checkpoint_state.json")
-    args = ap.parse_args()
+def list_all_chunks_across_folders(drive, proj_id: str) -> tuple[str, dict]:
+    """Lấy folder chunks chính và gộp danh sách file từ mọi folder tên 'chunks' (chống race condition khi 10 luồng chạy song song)."""
+    q = (
+        f"'{proj_id}' in parents and name = 'chunks' "
+        "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    )
+    res = drive.files().list(
+        q=q, fields="files(id,createdTime)", pageSize=20, supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
+    folders = sorted(res.get("files") or [], key=lambda x: x.get("createdTime") or "")
+    if not folders:
+        primary_id = ensure_folder(drive, proj_id, "chunks")
+        return primary_id, {}
 
-    drive, sheets = get_services()
-    row_info = read_task_row(sheets, args.row)
-    proj_id, proj_name = resolve_project_folder(drive, sheets, args.row, args.project, create_if_missing=False)
-    root_files = list_folder_files(drive, proj_id)
+    primary_id = folders[0]["id"]
+    merged = {}
+    for fld in folders:
+        files_map = list_folder_files(drive, fld["id"])
+        for fname, fmeta in files_map.items():
+            if fname not in merged or int(fmeta.get("size") or 0) > int(merged[fname].get("size") or 0):
+                merged[fname] = fmeta
+    return primary_id, merged
 
-    if row_info["voiceover_url"] and "voiceover_final.wav" in root_files and "timings.json" in root_files:
-        if row_info["status"] in ("Gdrive", "Ready"):
-            update_cells(sheets, {f"B{args.row}": "Voiceover"})
-        print(f"Row {args.row}: voiceover_final.wav + timings.json already complete; skipping.")
-        return
 
-    if "manifest.json" not in root_files:
-        raise RuntimeError(f"Row {args.row}: manifest.json missing in project folder {proj_name} ({proj_id})")
-
-    work_dir = Path("work") / f"row_{args.row}"
-    chunks_local_dir = work_dir / "chunks"
-    chunks_local_dir.mkdir(parents=True, exist_ok=True)
-    Path(args.checkpoint_state).parent.mkdir(parents=True, exist_ok=True)
-
-    manifest_local = work_dir / "manifest.json"
-    download_drive_file(drive, root_files["manifest.json"]["id"], str(manifest_local))
-    manifest = json.loads(manifest_local.read_text(encoding="utf-8"))
-    chunks_spec = manifest.get("chunks") or []
-    if not chunks_spec:
-        raise RuntimeError(f"Row {args.row}: manifest has 0 chunks")
-
-    chunks_drive_id = ensure_folder(drive, proj_id, "chunks")
-    existing_chunk_files = list_folder_files(drive, chunks_drive_id)
-
-    missing_indices = []
+def run_shard_synthesis(
+    drive,
+    sheets,
+    args,
+    proj_id: str,
+    proj_name: str,
+    chunks_spec: list,
+    chunks_drive_id: str,
+    existing_chunk_files: dict,
+    t_job_start: float,
+):
+    shard_missing = []
     for item in chunks_spec:
         idx = int(item["index"])
+        if args.mode == "shard" and (idx % args.num_shards) != args.shard_id:
+            continue
         cname = f"chunk_{idx:04d}.wav"
         fmeta = existing_chunk_files.get(cname)
         if not fmeta or int(fmeta.get("size") or 0) < 512:
-            missing_indices.append(idx)
+            shard_missing.append(idx)
 
     print(
-        f"Row {args.row} ({proj_name}): total={len(chunks_spec)} chunks, "
-        f"already_on_drive={len(chunks_spec) - len(missing_indices)}, remaining={len(missing_indices)}"
+        f"[Shard {args.shard_id}/{args.num_shards}] Row {args.row} ({proj_name}): "
+        f"shard_remaining={len(shard_missing)} (total_chunks={len(chunks_spec)})",
+        flush=True,
     )
+    if not shard_missing:
+        return
 
-    if missing_indices:
-        from omnivoice import OmniVoice
+    import torch
+    from omnivoice import OmniVoice
 
-        torch.set_num_threads(max(1, os.cpu_count() or 4))
-        model = OmniVoice.from_pretrained(
-            "k2-fsa/OmniVoice", device_map="cpu", dtype=torch.float32, asr_device="cpu"
+    torch.set_num_threads(max(1, os.cpu_count() or 4))
+    model = OmniVoice.from_pretrained(
+        "k2-fsa/OmniVoice", device_map="cpu", dtype=torch.float32, asr_device="cpu"
+    )
+    voice_prompt = model.create_voice_clone_prompt(ref_audio=args.ref_audio, ref_text=None)
+    soft_deadline_s = args.max_minutes * 60.0
+
+    chunks_local_dir = Path("work") / f"row_{args.row}" / f"shard_{args.shard_id}"
+    chunks_local_dir.mkdir(parents=True, exist_ok=True)
+    spec_by_idx = {int(c["index"]): c for c in chunks_spec}
+
+    for pos, idx in enumerate(shard_missing):
+        c_item = spec_by_idx[idx]
+        text = str(c_item["text"]).strip()
+        lang = c_item.get("lang") or detect_lang(text)
+        t0 = time.monotonic()
+
+        audio = model.generate(
+            text=text,
+            language=lang,
+            voice_clone_prompt=voice_prompt,
+            speed=args.speed,
+            num_step=args.num_step,
+        )[0].astype(np.float32)
+
+        peak = float(np.max(np.abs(audio))) or 1.0
+        if peak > 0.96:
+            audio = audio / peak * 0.96
+
+        cname = f"chunk_{idx:04d}.wav"
+        local_chunk = chunks_local_dir / cname
+        sf.write(str(local_chunk), audio, SR, subtype="PCM_16")
+
+        # Bắt buộc upload ngay lên Drive trước khi sang câu kế
+        fid = upsert_file(drive, chunks_drive_id, str(local_chunk), cname, "audio/wav")
+        existing_chunk_files[cname] = {"id": fid, "name": cname, "size": local_chunk.stat().st_size}
+
+        gen_s = time.monotonic() - t0
+        dur_s = len(audio) / SR
+        elapsed_min = (time.monotonic() - t_job_start) / 60.0
+        print(
+            f"[Shard {args.shard_id} | chunk {idx + 1}/{len(chunks_spec)}] "
+            f"{len(text)} chars -> {dur_s:.2f}s audio in {gen_s:.1f}s (uploaded {cname}, elapsed={elapsed_min:.1f}m)",
+            flush=True,
         )
-        voice_prompt = model.create_voice_clone_prompt(ref_audio=args.ref_audio, ref_text=None)
-        soft_deadline_s = args.max_minutes * 60.0
 
-        spec_by_idx = {int(c["index"]): c for c in chunks_spec}
-        for pos, idx in enumerate(missing_indices):
-            c_item = spec_by_idx[idx]
-            text = str(c_item["text"]).strip()
-            lang = c_item.get("lang") or detect_lang(text)
-            t0 = time.monotonic()
-
-            audio = model.generate(
-                text=text,
-                language=lang,
-                voice_clone_prompt=voice_prompt,
-                speed=args.speed,
-                num_step=args.num_step,
-            )[0].astype(np.float32)
-
-            peak = float(np.max(np.abs(audio))) or 1.0
-            if peak > 0.96:
-                audio = audio / peak * 0.96
-
-            cname = f"chunk_{idx:04d}.wav"
-            local_chunk = chunks_local_dir / cname
-            sf.write(str(local_chunk), audio, SR, subtype="PCM_16")
-
-            # MANDATORY SPEC RULE: Upload immediately to Drive before starting next chunk!
-            fid = upsert_file(drive, chunks_drive_id, str(local_chunk), cname, "audio/wav")
-            existing_chunk_files[cname] = {"id": fid, "name": cname, "size": local_chunk.stat().st_size}
-
-            done_cnt = len(existing_chunk_files)
-            tot_cnt = len(chunks_spec)
-            pct = int(round(done_cnt * 100.0 / max(1, tot_cnt)))
+        # Chỉ luồng 0 cập nhật trực tiếp tổng số chunk từ Drive lên cột G để tránh 10 luồng ghi đè nhau
+        if args.mode != "shard" or args.shard_id == 0:
             try:
+                _, latest_map = list_all_chunks_across_folders(drive, proj_id)
+                done_cnt = sum(
+                    1 for k, v in latest_map.items()
+                    if k.startswith("chunk_") and k.endswith(".wav") and int(v.get("size") or 0) >= 512
+                )
+                tot_cnt = len(chunks_spec)
+                pct = int(round(done_cnt * 100.0 / max(1, tot_cnt)))
                 update_cells(sheets, {
                     f"B{args.row}": "Voiceover",
-                    f"G{args.row}": f"🎙 Đang đọc giọng Peter: {done_cnt}/{tot_cnt} câu ({pct}%)",
+                    f"G{args.row}": f"🎙 Đang đọc (10 luồng song song): {done_cnt}/{tot_cnt} câu ({pct}%)",
                 })
             except Exception:
                 pass
 
-            gen_s = time.monotonic() - t0
-            dur_s = len(audio) / SR
-            elapsed_min = (time.monotonic() - t_job_start) / 60.0
-            print(
-                f"[chunk {idx + 1}/{len(chunks_spec)}] {len(text)} chars -> {dur_s:.2f}s audio "
-                f"in {gen_s:.1f}s (uploaded {cname}, elapsed={elapsed_min:.1f}m)",
-                flush=True,
-            )
+        if pos + 1 < len(shard_missing) and (time.monotonic() - t_job_start) >= soft_deadline_s:
+            print(f"[Shard {args.shard_id}] Reached soft timeout ({elapsed_min:.1f}m); yielding to merge/continuation.")
+            return
 
-            remaining_after = missing_indices[pos + 1 :]
-            if remaining_after and (time.monotonic() - t_job_start) >= soft_deadline_s:
-                ckpt = {
-                    "needs_continuation": True,
-                    "row": args.row,
-                    "pdf_link": row_info["pdf_link"] or "resume",
-                    "project_folder_url": folder_url(proj_id),
-                    "next_chunk": remaining_after[0],
-                    "completed_chunks": len(chunks_spec) - len(remaining_after),
-                    "total_chunks": len(chunks_spec),
-                }
-                Path(args.checkpoint_state).write_text(json.dumps(ckpt, indent=2), encoding="utf-8")
-                upsert_file(drive, proj_id, args.checkpoint_state, "checkpoint.json", "application/json")
-                print(f"Approaching job timeout ({elapsed_min:.1f}m). Saved checkpoint -> next_chunk={remaining_after[0]}")
-                return
 
-    # All chunks exist on Drive -> download any previously generated chunks not yet on local disk
+def run_merge_final(
+    drive,
+    sheets,
+    args,
+    row_info: dict,
+    proj_id: str,
+    proj_name: str,
+    chunks_spec: list,
+):
+    _, all_chunk_files = list_all_chunks_across_folders(drive, proj_id)
+    missing = []
+    for item in chunks_spec:
+        idx = int(item["index"])
+        cname = f"chunk_{idx:04d}.wav"
+        fmeta = all_chunk_files.get(cname)
+        if not fmeta or int(fmeta.get("size") or 0) < 512:
+            missing.append(idx)
+
+    if missing:
+        ckpt = {
+            "needs_continuation": True,
+            "row": args.row,
+            "pdf_link": row_info["pdf_link"] or "resume",
+            "project_folder_url": folder_url(proj_id),
+            "next_chunk": missing[0],
+            "completed_chunks": len(chunks_spec) - len(missing),
+            "total_chunks": len(chunks_spec),
+        }
+        Path(args.checkpoint_state).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.checkpoint_state).write_text(json.dumps(ckpt, indent=2), encoding="utf-8")
+        upsert_file(drive, proj_id, args.checkpoint_state, "checkpoint.json", "application/json")
+        done_cnt = len(chunks_spec) - len(missing)
+        update_cells(sheets, {
+            f"G{args.row}": f"🔄 Đã xong {done_cnt}/{len(chunks_spec)} câu — đang nối ca đọc nốt {len(missing)} câu còn lại..."
+        })
+        print(f"[Job 11 Merge] Still missing {len(missing)} chunks ({missing[:10]}...); triggered continuation dispatch.")
+        return
+
+    print(f"[Job 11 Merge] All {len(chunks_spec)} chunks verified on Drive! Merging with {args.gap_sec:.2f}s spacing...", flush=True)
+    update_cells(sheets, {
+        f"G{args.row}": f"🎚 Tiến trình #11 đang ghép {len(chunks_spec)} chunks (cách nhau {args.gap_sec:.1f}s) & chuẩn hóa -14 LUFS..."
+    })
+
+    work_dir = Path("work") / f"row_{args.row}"
+    chunks_local_dir = work_dir / "merge_chunks"
+    chunks_local_dir.mkdir(parents=True, exist_ok=True)
+
     pieces = [np.zeros(int(round(LEAD_IN_S * SR)), dtype=np.float32)]
     cursor_samples = len(pieces[0])
     timing_items = []
+    gap_samples = int(round(args.gap_sec * SR))
+    tail_samples = int(round(TAIL_S * SR))
 
     for pos, item in enumerate(chunks_spec):
         idx = int(item["index"])
         cname = f"chunk_{idx:04d}.wav"
         local_chunk = chunks_local_dir / cname
         if not local_chunk.is_file():
-            download_drive_file(drive, existing_chunk_files[cname]["id"], str(local_chunk))
+            download_drive_file(drive, all_chunk_files[cname]["id"], str(local_chunk))
 
         pcm, sr = sf.read(str(local_chunk), dtype="float32", always_2d=False)
         if pcm.ndim > 1:
@@ -228,14 +269,9 @@ def main():
         cursor_samples += len(pcm)
 
         if pos < len(chunks_spec) - 1:
-            next_page = int(chunks_spec[pos + 1].get("page") or item.get("page") or 1)
-            cur_page = int(item.get("page") or 1)
-            pause_s = PAGE_TURN_PAUSE_S if next_page != cur_page else SAME_PAGE_PAUSE_S
-            pause_samples = int(round(pause_s * SR))
-            pieces.append(np.zeros(pause_samples, dtype=np.float32))
-            cursor_samples += pause_samples
+            pieces.append(np.zeros(gap_samples, dtype=np.float32))
+            cursor_samples += gap_samples
         else:
-            tail_samples = int(round(TAIL_S * SR))
             pieces.append(np.zeros(tail_samples, dtype=np.float32))
             cursor_samples += tail_samples
 
@@ -250,7 +286,6 @@ def main():
             "end_s": round(end_s, 4),
         })
 
-    # Pad exact frame boundary @ 30fps
     total_s_raw = cursor_samples / SR
     total_s = math.ceil(total_s_raw * FPS) / FPS
     pad_end = max(0, int(round(total_s * SR)) - cursor_samples)
@@ -268,6 +303,7 @@ def main():
         "schema_version": "2.4",
         "fps": FPS,
         "sample_rate": SR,
+        "chunk_gap_s": args.gap_sec,
         "total_s": round(total_s, 4),
         "chunk_count": len(timing_items),
         "voice": "Peter (Peter_voice_mau2_tre_20261116.wav)",
@@ -276,6 +312,7 @@ def main():
     timings_path = work_dir / "timings.json"
     timings_path.write_text(json.dumps(timings_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    Path(args.checkpoint_state).parent.mkdir(parents=True, exist_ok=True)
     Path(args.checkpoint_state).write_text(
         json.dumps({"needs_continuation": False, "row": args.row}, indent=2), encoding="utf-8"
     )
@@ -288,9 +325,64 @@ def main():
         f"C{args.row}": folder_url(proj_id),
         f"D{args.row}": wav_url,
         f"B{args.row}": "Html",
-        f"G{args.row}": f"🎨 Đã đọc xong {len(timing_items)} câu ({total_s:.0f}s) — đang dựng HTML 16:9...",
+        f"G{args.row}": f"🎨 Đã ghép xong {len(timing_items)} câu ({total_s:.0f}s, nghỉ {args.gap_sec:.1f}s) — đang dựng HTML 16:9...",
     })
-    print(f"Completed voiceover for row {args.row}: duration={total_s:.2f}s -> {wav_url}")
+    print(f"[Job 11 Merge] Completed voiceover_final.wav for row {args.row}: duration={total_s:.2f}s -> {wav_url}", flush=True)
+
+
+def main():
+    t_job_start = time.monotonic()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--row", type=int, required=True)
+    ap.add_argument("--project", default="")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--mode", choices=["shard", "merge", "full"], default="full")
+    ap.add_argument("--shard-id", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=10)
+    ap.add_argument("--gap-sec", type=float, default=CHUNK_GAP_S)
+    ap.add_argument("--ref-audio", default="peter_ref.wav")
+    ap.add_argument("--num-step", type=int, default=32)
+    ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--max-minutes", type=float, default=float(os.environ.get("OMNI_SOFT_LIMIT_MIN", "225")))
+    ap.add_argument("--checkpoint-state", default="work/checkpoint_state.json")
+    args = ap.parse_args()
+
+    drive, sheets = get_services()
+    row_info = read_task_row(sheets, args.row)
+    proj_id, proj_name = resolve_project_folder(drive, sheets, args.row, args.project, create_if_missing=False)
+    root_files = list_folder_files(drive, proj_id)
+
+    if row_info["voiceover_url"] and "voiceover_final.wav" in root_files and "timings.json" in root_files:
+        if row_info["status"] in ("Gdrive", "Ready", "Voiceover"):
+            update_cells(sheets, {f"B{args.row}": "Html"})
+        print(f"Row {args.row}: voiceover_final.wav + timings.json already complete; skipping.")
+        return
+
+    if "manifest.json" not in root_files:
+        raise RuntimeError(f"Row {args.row}: manifest.json missing in project folder {proj_name} ({proj_id})")
+
+    work_dir = Path("work") / f"row_{args.row}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    manifest_local = work_dir / "manifest.json"
+    download_drive_file(drive, root_files["manifest.json"]["id"], str(manifest_local))
+    manifest = json.loads(manifest_local.read_text(encoding="utf-8"))
+    chunks_spec = manifest.get("chunks") or []
+    if not chunks_spec:
+        raise RuntimeError(f"Row {args.row}: manifest has 0 chunks")
+
+    chunks_drive_id, existing_chunk_files = list_all_chunks_across_folders(drive, proj_id)
+
+    if args.mode == "shard":
+        run_shard_synthesis(
+            drive, sheets, args, proj_id, proj_name, chunks_spec, chunks_drive_id, existing_chunk_files, t_job_start
+        )
+    elif args.mode == "merge":
+        run_merge_final(drive, sheets, args, row_info, proj_id, proj_name, chunks_spec)
+    else:
+        run_shard_synthesis(
+            drive, sheets, args, proj_id, proj_name, chunks_spec, chunks_drive_id, existing_chunk_files, t_job_start
+        )
+        run_merge_final(drive, sheets, args, row_info, proj_id, proj_name, chunks_spec)
 
 
 if __name__ == "__main__":
