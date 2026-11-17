@@ -280,7 +280,8 @@ def main():
     update_cells(sheets, {
         f"C{args.row}": folder_url(proj_id),
         f"E{args.row}": html_url,
-        f"B{args.row}": "Html",
+        f"B{args.row}": "Video",
+        f"G{args.row}": "🎬 Đã dựng xong HTML 16:9 — đang xuất video MP4...",
     })
     print(f"Built karaoke_16x9.html for row {args.row} -> {html_url}")
 

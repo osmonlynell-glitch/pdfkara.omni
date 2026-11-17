@@ -168,6 +168,17 @@ def main():
             fid = upsert_file(drive, chunks_drive_id, str(local_chunk), cname, "audio/wav")
             existing_chunk_files[cname] = {"id": fid, "name": cname, "size": local_chunk.stat().st_size}
 
+            done_cnt = len(existing_chunk_files)
+            tot_cnt = len(chunks_spec)
+            pct = int(round(done_cnt * 100.0 / max(1, tot_cnt)))
+            try:
+                update_cells(sheets, {
+                    f"B{args.row}": "Voiceover",
+                    f"G{args.row}": f"🎙 Đang đọc giọng Peter: {done_cnt}/{tot_cnt} câu ({pct}%)",
+                })
+            except Exception:
+                pass
+
             gen_s = time.monotonic() - t0
             dur_s = len(audio) / SR
             elapsed_min = (time.monotonic() - t_job_start) / 60.0
@@ -276,7 +287,8 @@ def main():
     update_cells(sheets, {
         f"C{args.row}": folder_url(proj_id),
         f"D{args.row}": wav_url,
-        f"B{args.row}": "Voiceover",
+        f"B{args.row}": "Html",
+        f"G{args.row}": f"🎨 Đã đọc xong {len(timing_items)} câu ({total_s:.0f}s) — đang dựng HTML 16:9...",
     })
     print(f"Completed voiceover for row {args.row}: duration={total_s:.2f}s -> {wav_url}")
 

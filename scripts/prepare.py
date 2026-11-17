@@ -138,7 +138,7 @@ def main():
     if existing_proj_id:
         existing_files = list_folder_files(drive, existing_proj_id)
         if "manifest.json" in existing_files:
-            update_cells(sheets, {f"C{args.row}": folder_url(existing_proj_id), f"B{args.row}": "Gdrive"})
+            update_cells(sheets, {f"C{args.row}": folder_url(existing_proj_id), f"B{args.row}": "Voiceover", f"G{args.row}": "🎙 Đã tách câu xong — đang khởi động OmniVoice..."})
             print(f"Row {args.row}: manifest.json already exists in {existing_proj_name}; skipped prepare.")
             return
         if "source.pdf" in existing_files:
@@ -155,7 +155,11 @@ def main():
         proj_id, proj_name = resolve_project_folder(drive, sheets, args.row, default_proj, create_if_missing=True)
         existing_files = list_folder_files(drive, proj_id)
         if "manifest.json" in existing_files:
-            update_cells(sheets, {f"C{args.row}": folder_url(proj_id), f"B{args.row}": "Gdrive"})
+            update_cells(sheets, {
+        f"C{args.row}": folder_url(proj_id),
+        f"B{args.row}": "Voiceover",
+        f"G{args.row}": f"🎙 Đã tách {len(chunks)} câu ({len(pages_meta)} trang) — đang đọc giọng Peter...",
+    })
             print(f"Row {args.row}: manifest.json already exists in {proj_name}; skipped prepare.")
             return
         upsert_file(drive, proj_id, str(local_pdf), "source.pdf", "application/pdf")
@@ -185,7 +189,11 @@ def main():
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     upsert_file(drive, proj_id, str(manifest_path), "manifest.json", "application/json")
 
-    update_cells(sheets, {f"C{args.row}": folder_url(proj_id), f"B{args.row}": "Gdrive"})
+    update_cells(sheets, {
+        f"C{args.row}": folder_url(proj_id),
+        f"B{args.row}": "Voiceover",
+        f"G{args.row}": f"🎙 Đã tách {len(chunks)} câu ({len(pages_meta)} trang) — đang đọc giọng Peter...",
+    })
     print(f"Prepared row {args.row}: {len(pages_meta)} pages, {len(chunks)} chunks -> {folder_url(proj_id)}")
 
 

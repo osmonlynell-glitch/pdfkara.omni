@@ -393,7 +393,7 @@ def cli_poll_sheet(args):
     for r in rows:
         if dispatched >= args.max_dispatch:
             break
-        if r["status"] == "Gdrive" and r["project_url"] and not r["voiceover_url"] and repo:
+        if r["status"] in ("Gdrive", "Voiceover") and r["project_url"] and not r["voiceover_url"] and repo:
             dispatch_github_workflow(
                 repo,
                 "omnivoice.yml",
