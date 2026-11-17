@@ -125,19 +125,40 @@ def main():
     work_dir = Path("work") / f"row_{args.row}"
     work_dir.mkdir(parents=True, exist_ok=True)
     local_pdf = work_dir / "source.pdf"
-    orig_name = download_pdf_source(drive, pdf_link, str(local_pdf))
 
     stamp = dt.datetime.now(dt.timezone(dt.timedelta(hours=7))).strftime("%Y%m%d-%H%M")
-    default_proj = args.project.strip() or f"{slugify_name(orig_name)}_{stamp}"
-    proj_id, proj_name = resolve_project_folder(drive, sheets, args.row, default_proj, create_if_missing=True)
+    existing_proj_id = ""
+    try:
+        existing_proj_id, existing_proj_name = resolve_project_folder(
+            drive, sheets, args.row, args.project.strip(), create_if_missing=False
+        )
+    except Exception:
+        existing_proj_id, existing_proj_name = "", ""
 
-    existing_files = list_folder_files(drive, proj_id)
-    if "manifest.json" in existing_files:
-        update_cells(sheets, {f"C{args.row}": folder_url(proj_id), f"B{args.row}": "Gdrive"})
-        print(f"Row {args.row}: manifest.json already exists in {proj_name}; skipped prepare.")
-        return
-
-    upsert_file(drive, proj_id, str(local_pdf), "source.pdf", "application/pdf")
+    if existing_proj_id:
+        existing_files = list_folder_files(drive, existing_proj_id)
+        if "manifest.json" in existing_files:
+            update_cells(sheets, {f"C{args.row}": folder_url(existing_proj_id), f"B{args.row}": "Gdrive"})
+            print(f"Row {args.row}: manifest.json already exists in {existing_proj_name}; skipped prepare.")
+            return
+        if "source.pdf" in existing_files:
+            from gcommon import download_drive_file
+            download_drive_file(drive, existing_files["source.pdf"]["id"], str(local_pdf))
+            orig_name = existing_proj_name + ".pdf"
+        else:
+            orig_name = download_pdf_source(drive, pdf_link, str(local_pdf))
+            upsert_file(drive, existing_proj_id, str(local_pdf), "source.pdf", "application/pdf")
+        proj_id, proj_name = existing_proj_id, existing_proj_name
+    else:
+        orig_name = download_pdf_source(drive, pdf_link, str(local_pdf))
+        default_proj = args.project.strip() or f"{slugify_name(orig_name)}_{stamp}"
+        proj_id, proj_name = resolve_project_folder(drive, sheets, args.row, default_proj, create_if_missing=True)
+        existing_files = list_folder_files(drive, proj_id)
+        if "manifest.json" in existing_files:
+            update_cells(sheets, {f"C{args.row}": folder_url(proj_id), f"B{args.row}": "Gdrive"})
+            print(f"Row {args.row}: manifest.json already exists in {proj_name}; skipped prepare.")
+            return
+        upsert_file(drive, proj_id, str(local_pdf), "source.pdf", "application/pdf")
     pages_meta, chunks = extract_manifest_and_pages(str(local_pdf), work_dir)
     if not chunks:
         update_cells(sheets, {f"C{args.row}": folder_url(proj_id), f"B{args.row}": "Error"})
