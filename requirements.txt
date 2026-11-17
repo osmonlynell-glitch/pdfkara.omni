@@ -1,0 +1,6 @@
+omnivoice==0.2.1
+pymupdf>=1.24.0
+soundfile>=0.12.1
+numpy>=1.26.0
+google-api-python-client>=2.140.0
+google-auth>=2.34.0
