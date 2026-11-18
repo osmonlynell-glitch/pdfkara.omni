@@ -19,8 +19,15 @@ from gcommon import (
     upsert_file,
     download_pdf_source,
 )
-
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+(?=[A-ZÀÁẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬĐÈÉẺẼẸÊẾỀỂỄỆÌÍỈĨỊÒÓỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢÙÚỦŨỤƯỨỪỬỮỰỲÝỶỸỴ0-9\"'“‘(\[])")
+from mushu_word_kit import (
+    HAS_ALNUM_RE,
+    extract_raw_page_blocks,
+    filter_headers_and_footers,
+    order_and_coalesce_page_blocks,
+    resolve_words_for_chunks_from_pdf,
+    split_chunk_clauses,
+    split_clean_sentences,
+)
 
 
 def slugify_name(filename: str) -> str:
@@ -30,25 +37,14 @@ def slugify_name(filename: str) -> str:
     return clean[:48] or "pdf-doc"
 
 
-def is_noise_block(text: str, y0_norm: float, y1_norm: float) -> bool:
-    t = text.strip()
-    if not t:
-        return True
-    if re.fullmatch(r"(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?", t, flags=re.IGNORECASE):
-        return True
-    if (y0_norm < 0.055 or y1_norm > 0.945) and len(t) <= 60 and re.fullmatch(r"[\d\s./\-–—|]+", t):
-        return True
-    return False
-
-
 def extract_manifest_and_pages(pdf_path: str, work_dir: Path, dpi: int = 220):
+    """Extract 220 DPI page images and column-ordered body chunks via mushu_word_kit."""
     doc = fitz.open(pdf_path)
     pages_dir = work_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     pages_meta = []
-    chunks = []
-    chunk_idx = 0
+    raw_pages_blocks = []
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -65,46 +61,34 @@ def extract_manifest_and_pages(pdf_path: str, work_dir: Path, dpi: int = 220):
             "pt_width": round(pw, 2),
             "pt_height": round(ph, 2),
         })
+        raw_pages_blocks.append(extract_raw_page_blocks(page))
 
-        blocks = page.get_text("blocks")
-        blocks.sort(key=lambda b: (round(b[1] / 12.0), b[0]))
-        for b in blocks:
-            if len(b) >= 7 and b[6] != 0:
-                continue
-            bx0, by0, bx1, by1, raw_txt = b[0], b[1], b[2], b[3], b[4]
-            y0n, y1n = by0 / ph, by1 / ph
-            cleaned_block = re.sub(r"\s+", " ", (raw_txt or "").replace("-\n", "")).strip()
-            if is_noise_block(cleaned_block, y0n, y1n):
-                continue
-
-            parts = [s.strip() for s in SENTENCE_SPLIT_RE.split(cleaned_block) if s.strip()]
-            for sent in parts:
-                found_rects = page.search_for(sent[:120])
-                norm_rects = []
-                for r in found_rects:
-                    if r.y1 < by0 - 8 or r.y0 > by1 + 8:
+    filtered_pages = filter_headers_and_footers(raw_pages_blocks)
+    chunks = []
+    chunk_idx = 0
+    for pno, page_blocks in enumerate(filtered_pages):
+        ordered_blocks = order_and_coalesce_page_blocks(page_blocks)
+        for para_idx, b in enumerate(ordered_blocks):
+            for raw_sent in split_clean_sentences(b["text"]):
+                for sent in split_chunk_clauses(raw_sent, max_chars=240):
+                    if not HAS_ALNUM_RE.search(sent):
                         continue
-                    norm_rects.append([
-                        round(max(0.0, min(1.0, r.x0 / pw)), 5),
-                        round(max(0.0, min(1.0, r.y0 / ph)), 5),
-                        round(max(0.0, min(1.0, r.x1 / pw)), 5),
-                        round(max(0.0, min(1.0, r.y1 / ph)), 5),
-                    ])
-                if not norm_rects:
-                    norm_rects = [[
-                        round(max(0.0, min(1.0, bx0 / pw)), 5),
-                        round(max(0.0, min(1.0, by0 / ph)), 5),
-                        round(max(0.0, min(1.0, bx1 / pw)), 5),
-                        round(max(0.0, min(1.0, by1 / ph)), 5),
-                    ]]
-                chunks.append({
-                    "index": chunk_idx,
-                    "page": pno + 1,
-                    "text": sent,
-                    "rects": norm_rects,
-                })
-                chunk_idx += 1
+                    chunks.append({
+                        "index": chunk_idx,
+                        "id": f"chunk_{chunk_idx:04d}",
+                        "page": pno + 1,
+                        "para": para_idx,
+                        "text": sent,
+                        "rects": [[
+                            round(b["x0"], 5),
+                            round(b["y0"], 5),
+                            round(b["x1"], 5),
+                            round(b["y1"], 5),
+                        ]],
+                    })
+                    chunk_idx += 1
 
+    resolve_words_for_chunks_from_pdf(doc, chunks)
     doc.close()
     return pages_meta, chunks
 
@@ -158,7 +142,7 @@ def main():
             update_cells(sheets, {
         f"C{args.row}": folder_url(proj_id),
         f"B{args.row}": "Voiceover",
-        f"G{args.row}": f"🎙 Đã tách {len(chunks)} câu ({len(pages_meta)} trang) — đang đọc giọng Peter...",
+        f"G{args.row}": f"🎙 Đã tách sẵn manifest — đang đọc giọng Patrick...",
     })
             print(f"Row {args.row}: manifest.json already exists in {proj_name}; skipped prepare.")
             return
@@ -174,7 +158,7 @@ def main():
         upsert_file(drive, pages_folder_id, str(img_file), img_file.name, "image/png")
 
     manifest = {
-        "schema_version": "2.4",
+        "schema_version": "2.6-column",
         "prepared_by": "prepare.py_fallback",
         "row": args.row,
         "project_name": proj_name,
@@ -192,7 +176,7 @@ def main():
     update_cells(sheets, {
         f"C{args.row}": folder_url(proj_id),
         f"B{args.row}": "Voiceover",
-        f"G{args.row}": f"🎙 Đã tách {len(chunks)} câu ({len(pages_meta)} trang) — đang đọc giọng Peter...",
+        f"G{args.row}": f"🎙 Đã tách {len(chunks)} câu ({len(pages_meta)} trang) — đang đọc giọng Patrick...",
     })
     print(f"Prepared row {args.row}: {len(pages_meta)} pages, {len(chunks)} chunks -> {folder_url(proj_id)}")
 
