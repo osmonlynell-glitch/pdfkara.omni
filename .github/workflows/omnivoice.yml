@@ -139,7 +139,7 @@ jobs:
           path: .hf
           key: pdfkara-omnivoice-hf-v1
 
-      - name: Download Peter reference WAV from Drive
+      - name: Download & normalize Patrick reference WAV from Drive
         run: python scripts/gcommon.py download-voice --out peter_ref.wav
 
       - name: Synthesize shard chunks & upload each WAV immediately

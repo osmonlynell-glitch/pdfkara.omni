@@ -4,7 +4,9 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -29,7 +31,7 @@ DEFAULT_TASKS_FOLDER_ID = os.environ.get(
     "KARAOKE_TASKS_FOLDER_ID", "1lV234BAYULLGPqyHgZUjB6F-epU0r4GW"
 )
 DEFAULT_PETER_VOICE_ID = os.environ.get(
-    "PETER_VOICE_FILE_ID", "11WgIQ26NG2rHKAk6mfMRpBUSKJntTUqX"
+    "PETER_VOICE_FILE_ID", "1_I5_ghdSI0a7qScPqc_j5dyBC9YQx4_N"
 )
 
 
@@ -405,8 +407,34 @@ def dispatch_github_workflow(repo_full_name: str, workflow_file: str, inputs: di
 
 def cli_download_voice(args):
     drive, _ = get_services()
-    download_drive_file(drive, args.voice_id or DEFAULT_PETER_VOICE_ID, args.out)
-    print(f"Downloaded Peter reference voice -> {args.out}")
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_fd, raw_name = tempfile.mkstemp(prefix="voice_raw_", dir=str(out_path.parent))
+    os.close(raw_fd)
+    try:
+        download_drive_file(drive, args.voice_id or DEFAULT_PETER_VOICE_ID, raw_name)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                raw_name,
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(out_path),
+            ],
+            check=True,
+        )
+    finally:
+        if os.path.exists(raw_name):
+            os.remove(raw_name)
+    print(f"Downloaded & normalized reference voice -> {args.out}")
 
 
 def cli_poll_sheet(args):

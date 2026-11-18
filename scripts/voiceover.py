@@ -599,7 +599,7 @@ def run_merge_final(
         "total_s": round(total_s, 4),
         "chunk_count": len(timing_items),
         "word_count": total_words,
-        "voice": "Peter (Peter_voice_mau2_tre_20261116.wav)",
+        "voice": "Patrick (Patrick.mp3, 1_I5_ghdSI0a7qScPqc_j5dyBC9YQx4_N)",
         "items": timing_items,
     }
     timings_path = work_dir / "timings.json"
