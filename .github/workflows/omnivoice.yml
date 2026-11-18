@@ -118,8 +118,9 @@ jobs:
 
       - name: Install FFmpeg & OmniVoice CPU packages
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg >/dev/null
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          fi
           python -m pip install -q --upgrade pip
           pip install -q torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -q -r requirements.txt
@@ -174,8 +175,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements.txt
+
+      - name: Cache Torch CPU pip wheels for ultra-fast align/merge
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pdfkara-torch-cpu-2.8.0-${{ runner.os }}
 
       - name: Cache TorchAudio MMS_FA model weights
         uses: actions/cache@v4
@@ -185,9 +190,9 @@ jobs:
 
       - name: Install FFmpeg & TorchAudio Forced-Alignment CPU packages
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg >/dev/null
-          python -m pip install -q --upgrade pip
+          if [[ "${{ inputs.stage }}" != "align" ]] && ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          fi
           pip install -q torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
           pip install -q soundfile numpy google-api-python-client google-auth
 
