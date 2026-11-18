@@ -437,15 +437,51 @@ def cli_download_voice(args):
     print(f"Downloaded & normalized reference voice -> {args.out}")
 
 
+def list_active_dispatch_runs(repo_full_name: str, workflow_file: str) -> list[str]:
+    """Return display titles of queued/in-progress workflow_dispatch runs to avoid duplicates."""
+    token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+    if not token or not repo_full_name:
+        return []
+    titles: list[str] = []
+    for st in ("in_progress", "queued"):
+        url = (
+            f"https://api.github.com/repos/{repo_full_name}/actions/workflows/{workflow_file}/runs"
+            f"?status={st}&event=workflow_dispatch&per_page=30"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            for run in data.get("workflow_runs") or []:
+                titles.append(str(run.get("display_title") or run.get("name") or ""))
+        except Exception as exc:
+            print(f"Warning checking active runs ({st}): {exc}", flush=True)
+    return titles
+
+
 def cli_poll_sheet(args):
     _, sheets = get_services()
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     rows = list_all_task_rows(sheets)
+    active_titles = list_active_dispatch_runs(repo, "omnivoice.yml")
+    max_concurrent = int(os.environ.get("MAX_ACTIVE_VOICEOVER_ROWS", "2") or "2")
+    active_slots = len(active_titles)
     dispatched = 0
     for r in rows:
-        if dispatched >= args.max_dispatch:
+        if dispatched >= args.max_dispatch or active_slots >= max_concurrent:
             break
-        if r["status"] in ("Gdrive", "Voiceover") and r["project_url"] and not r["voiceover_url"] and repo:
+        if r["status"] == "Voiceover" and r["project_url"] and not r["voiceover_url"] and repo:
+            tag = f"R{r['row']} "
+            if any(tag in t or t.endswith(f"R{r['row']}") for t in active_titles):
+                print(f"Skipping row {r['row']}: omnivoice.yml already active ({active_titles})")
+                continue
             dispatch_github_workflow(
                 repo,
                 "omnivoice.yml",
@@ -458,8 +494,9 @@ def cli_poll_sheet(args):
                 },
             )
             dispatched += 1
+            active_slots += 1
             print(f"Backup poll dispatched voiceover for row {r['row']}")
-    print(f"Poll finished, dispatched={dispatched}")
+    print(f"Poll finished, dispatched={dispatched}, active_before={len(active_titles)}")
 
 
 def cli_checkpoint_dispatch(args):
